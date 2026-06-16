@@ -137,6 +137,148 @@ pub(crate) unsafe fn form_array_from_datum(
     }
 }
 
+/// Try to evaluate a non-Const, non-Param expression to a Cell value at
+/// planning time. This handles stable/immutable expressions like
+/// `now() - interval '1 hour'` by asking PostgreSQL to evaluate them.
+///
+/// # Safety
+///
+/// `expr` must be a valid expression node pointer.
+unsafe fn try_eval_const_expr(expr: *mut pg_sys::Node) -> Option<Cell> {
+    unsafe {
+        // Use eval_const_expressions to try to simplify the expression.
+        // This will fold stable functions (like now()) that are safe to
+        // evaluate at planning time.
+        let simplified = pg_sys::eval_const_expressions(ptr::null_mut(), expr);
+        if simplified.is_null() {
+            return None;
+        }
+
+        // If it simplified to a Const, extract the value
+        if is_a(simplified, pg_sys::NodeTag::T_Const) {
+            let cst = simplified as *mut pg_sys::Const;
+            return Cell::from_polymorphic_datum(
+                (*cst).constvalue,
+                (*cst).constisnull,
+                (*cst).consttype,
+            );
+        }
+
+        // If not fully reduced to Const, try direct evaluation via the executor.
+        // This handles cases like now() which is stable within a transaction.
+        let expr_type = pg_sys::exprType(expr);
+        let expr_typmod = pg_sys::exprTypmod(expr);
+
+        // Build a simple expression evaluation to get the result
+        let estate = pg_sys::CreateExecutorState();
+        if estate.is_null() {
+            return None;
+        }
+
+        let expr_state = pg_sys::ExecInitExpr(expr as *mut pg_sys::Expr, ptr::null_mut());
+        if expr_state.is_null() {
+            pg_sys::FreeExecutorState(estate);
+            return None;
+        }
+
+        let econtext = pg_sys::MakePerTupleExprContext(estate);
+        let mut is_null = false;
+        let datum = pg_sys::ExecEvalExprSwitchContext(expr_state, econtext, &mut is_null);
+
+        let result = if is_null {
+            None
+        } else {
+            Cell::from_polymorphic_datum(datum, false, expr_type)
+        };
+
+        pg_sys::FreeExecutorState(estate);
+        let _ = expr_typmod; // suppress unused warning
+
+        result
+    }
+}
+
+/// Try to extract a JSONB sub-field qual from `(col->>'key') op const`.
+///
+/// Returns a Qual with field = "col.key" if successful, so FDWs can
+/// distinguish jsonb sub-field conditions from top-level column conditions.
+///
+/// # Safety
+///
+/// `left` must be a valid OpExpr node, `right` must be a valid Const node.
+unsafe fn try_extract_jsonb_qual(
+    baserel_id: pg_sys::Oid,
+    baserel_ids: pg_sys::Relids,
+    left: *mut pg_sys::OpExpr,
+    right: *mut pg_sys::Const,
+    outer_op_name: &pgrx::pg_sys::nameData,
+) -> Option<Qual> {
+    unsafe {
+        pgrx::memcx::current_context(|mcx| {
+            let inner_args = List::<*mut c_void>::downcast_ptr_in_memcx((*left).args, mcx)?;
+            if inner_args.len() != 2 {
+                return None;
+            }
+
+            let inner_left = unnest_clause(*inner_args.get(0)? as _);
+            let inner_right = unnest_clause(*inner_args.get(1)? as _);
+
+            // Require: inner_left is a Var (jsonb/json column)
+            if !is_a(inner_left, pg_sys::NodeTag::T_Var) {
+                return None;
+            }
+            // Require: inner_right is a text Const (the key)
+            if !is_a(inner_right, pg_sys::NodeTag::T_Const) {
+                return None;
+            }
+
+            let inner_var = inner_left as *mut pg_sys::Var;
+            if !pg_sys::bms_is_member((*inner_var).varno as c_int, baserel_ids)
+                || (*inner_var).varattno < 1
+            {
+                return None;
+            }
+
+            // Check operator name is ->> (text extraction) or -> (json)
+            let inner_opr = get_operator((*left).opno);
+            if inner_opr.is_null() {
+                return None;
+            }
+            let inner_op_name = pgrx::name_data_to_str(&(*inner_opr).oprname);
+            if inner_op_name != "->>" && inner_op_name != "->" {
+                return None;
+            }
+
+            // Extract the JSONB key from inner_right (text datum = varlena)
+            let key_const = inner_right as *mut pg_sys::Const;
+            let key = String::from_datum((*key_const).constvalue, (*key_const).constisnull)?;
+
+            // Extract the outer value from right (the comparison value)
+            let value = Cell::from_polymorphic_datum(
+                (*right).constvalue,
+                (*right).constisnull,
+                (*right).consttype,
+            )?;
+
+            // Get the column name
+            let col_name = pg_sys::get_attname(baserel_id, (*inner_var).varattno, false);
+            let col_name_str = std::ffi::CStr::from_ptr(col_name).to_str().ok()?;
+
+            // Encode as "col.key" so FDWs can detect JSONB sub-field conditions
+            let field = format!("{col_name_str}.{key}");
+            let operator = pgrx::name_data_to_str(outer_op_name).to_string();
+
+            Some(Qual {
+                field,
+                operator,
+                value: Value::Cell(value),
+                use_or: false,
+                param: None,
+            })
+        })
+    }
+}
+
 pub(crate) unsafe fn get_operator(opno: pg_sys::Oid) -> pg_sys::Form_pg_operator {
     unsafe {
         let htup = pg_sys::SearchSysCache1(
@@ -199,6 +341,21 @@ pub(crate) unsafe fn extract_from_op_expr(
                     std::mem::swap(&mut left, &mut right);
                 }
 
+                // Handle jsonb extraction: (col->>'key') op const
+                // Produces field = "col.key" so FDWs can recognize JSONB sub-field quals.
+                if is_a(left, pg_sys::NodeTag::T_OpExpr)
+                    && is_a(right, pg_sys::NodeTag::T_Const)
+                    && let Some(jsonb_qual) = try_extract_jsonb_qual(
+                        baserel_id,
+                        baserel_ids,
+                        left as _,
+                        right as _,
+                        &(*opr).oprname,
+                    )
+                {
+                    return Some(jsonb_qual);
+                }
+
                 if is_a(left, pg_sys::NodeTag::T_Var) {
                     let left = left as *mut pg_sys::Var;
 
@@ -236,6 +393,10 @@ pub(crate) unsafe fn extract_from_op_expr(
                                 },
                             };
                             (Some(Cell::I64(0)), Some(param))
+                        } else if let Some(cell) = try_eval_const_expr(right) {
+                            // Try to evaluate stable/immutable expressions
+                            // like now() - interval '1 hour' to a constant
+                            (Some(cell), None)
                         } else {
                             (None, None)
                         };

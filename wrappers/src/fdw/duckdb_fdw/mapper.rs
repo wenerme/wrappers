@@ -84,42 +84,73 @@ pub(super) fn map_cell(
             .get::<_, Option<String>>(col_idx)
             .map(|v| v.map(Cell::String))
             .map_err(|e| e.into()),
-        pg_sys::DATEOID => src_row
-            .get::<_, Option<i64>>(col_idx)
-            .map(|v| {
-                v.map(|v| {
+        pg_sys::DATEOID => {
+            let v = src_row.get_ref::<_>(col_idx)?;
+            match v {
+                ValueRef::Null => Ok(None),
+                ValueRef::Date32(days) => {
+                    let ts = to_timestamp((days as i64 * 86_400) as f64);
+                    Ok(Some(Cell::Date(pgrx::prelude::Date::from(ts))))
+                }
+                ValueRef::BigInt(v) => {
                     let ts = to_timestamp((v * 86_400) as f64);
-                    Cell::Date(pgrx::prelude::Date::from(ts))
-                })
-            })
-            .map_err(|e| e.into()),
-        pg_sys::TIMEOID => {
-            let cell = if let Some(tm) = src_row.get::<_, Option<i64>>(col_idx)? {
-                let tm = Time::try_from(tm).map_err(|_| DateTimeConversionError::FieldOverflow)?;
-                Some(Cell::Time(tm))
-            } else {
-                None
-            };
-            Ok(cell)
+                    Ok(Some(Cell::Date(pgrx::prelude::Date::from(ts))))
+                }
+                _ => Err(DuckdbFdwError::UnsupportedColumnType(tgt_col.name.clone())),
+            }
         }
-        pg_sys::TIMESTAMPOID => src_row
-            .get::<_, Option<i64>>(col_idx)
-            .map(|v| {
-                v.map(|v| {
-                    let ts = to_timestamp((v / 1_000_000) as _);
-                    Cell::Timestamp(ts.to_utc())
-                })
-            })
-            .map_err(|e| e.into()),
-        pg_sys::TIMESTAMPTZOID => src_row
-            .get::<_, Option<i64>>(col_idx)
-            .map(|v| {
-                v.map(|v| {
-                    let ts = to_timestamp((v / 1_000_000) as _);
-                    Cell::Timestamptz(ts)
-                })
-            })
-            .map_err(|e| e.into()),
+        pg_sys::TIMEOID => {
+            let v = src_row.get_ref::<_>(col_idx)?;
+            match v {
+                ValueRef::Null => Ok(None),
+                ValueRef::Time64(unit, val) => {
+                    let micros = unit.to_micros(val);
+                    let tm = Time::try_from(micros)
+                        .map_err(|_| DateTimeConversionError::FieldOverflow)?;
+                    Ok(Some(Cell::Time(tm)))
+                }
+                ValueRef::BigInt(val) => {
+                    let tm =
+                        Time::try_from(val).map_err(|_| DateTimeConversionError::FieldOverflow)?;
+                    Ok(Some(Cell::Time(tm)))
+                }
+                _ => Err(DuckdbFdwError::UnsupportedColumnType(tgt_col.name.clone())),
+            }
+        }
+        pg_sys::TIMESTAMPOID => {
+            let v = src_row.get_ref::<_>(col_idx)?;
+            match v {
+                ValueRef::Null => Ok(None),
+                ValueRef::Timestamp(unit, val) => {
+                    let micros = unit.to_micros(val);
+                    let ts = to_timestamp(micros as f64 / 1_000_000.0);
+                    Ok(Some(Cell::Timestamp(ts.to_utc())))
+                }
+                // BigInt fallback: assumes value is in microseconds
+                ValueRef::BigInt(val) => {
+                    let ts = to_timestamp(val as f64 / 1_000_000.0);
+                    Ok(Some(Cell::Timestamp(ts.to_utc())))
+                }
+                _ => Err(DuckdbFdwError::UnsupportedColumnType(tgt_col.name.clone())),
+            }
+        }
+        pg_sys::TIMESTAMPTZOID => {
+            let v = src_row.get_ref::<_>(col_idx)?;
+            match v {
+                ValueRef::Null => Ok(None),
+                ValueRef::Timestamp(unit, val) => {
+                    let micros = unit.to_micros(val);
+                    let ts = to_timestamp(micros as f64 / 1_000_000.0);
+                    Ok(Some(Cell::Timestamptz(ts)))
+                }
+                // BigInt fallback: assumes value is in microseconds
+                ValueRef::BigInt(val) => {
+                    let ts = to_timestamp(val as f64 / 1_000_000.0);
+                    Ok(Some(Cell::Timestamptz(ts)))
+                }
+                _ => Err(DuckdbFdwError::UnsupportedColumnType(tgt_col.name.clone())),
+            }
+        }
         pg_sys::JSONBOID => {
             let v = src_row.get_ref::<_>(col_idx)?;
             match v {
@@ -173,12 +204,18 @@ pub(super) fn map_column_type(
         "DATE" => "date",
         "TIME" => "time",
         "TIMESTAMP WITH TIME ZONE" | "TIMESTAMPTZ" => "timestamp with time zone",
-        "TIMESTAMP" | "DATETIME" => "TIMESTAMP",
+        "TIMESTAMP" | "TIMESTAMP_S" | "TIMESTAMP_MS" | "TIMESTAMP_NS" | "DATETIME" => "TIMESTAMP",
         "DOUBLE" | "FLOAT8" => "double precision",
         "FLOAT" | "FLOAT4" | "REAL" => "real",
         "INTEGER" | "INT4" | "INT" | "SIGNED" => "integer",
         "SMALLINT" | "INT2" | "SHORT" => "smallint",
         "TINYINT" | "INT1" => "\"char\"",
+        "HUGEINT" => "numeric",
+        "UTINYINT" => "smallint",
+        "USMALLINT" => "integer",
+        "UINTEGER" => "bigint",
+        "UBIGINT" => "numeric",
+        "INTERVAL" => "interval",
         "UUID" => "uuid",
         s if s.starts_with("DECIMAL") => {
             let re = Regex::new(r"\((?<prec>\d+),(?<scale>\d+)\)").unwrap();

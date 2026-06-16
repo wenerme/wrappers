@@ -22,6 +22,9 @@ pub(super) enum ServerType {
 
     // SQL-like Remotes
     MotherDuck,
+
+    // Local DuckDB (for development/testing)
+    Local,
 }
 
 impl ServerType {
@@ -36,6 +39,7 @@ impl ServerType {
             "polaris" => Self::Polaris,
             "lakekeeper" => Self::Lakekeeper,
             "md" => Self::MotherDuck,
+            "local" => Self::Local,
             _ => return Err(DuckdbFdwError::InvalidServerType(svr_type.to_owned())),
         };
         Ok(ret)
@@ -51,6 +55,7 @@ impl ServerType {
             Self::Polaris => "polaris",
             Self::Lakekeeper => "lakekeeper",
             Self::MotherDuck => "md",
+            Self::Local => "local",
         }
     }
 
@@ -71,7 +76,8 @@ impl ServerType {
                 "install iceberg;load iceberg;"
             }
             Self::MotherDuck => "install md;load md;",
-            _ => "",
+            Self::S3 | Self::R2 => "load httpfs;",
+            Self::Local => "",
         }
     }
 
@@ -100,7 +106,7 @@ impl ServerType {
                 "oauth2_scope",
                 "oauth2_server_uri",
             ],
-            Self::MotherDuck => vec![],
+            Self::MotherDuck | Self::Local => vec![],
         }
     }
 
@@ -176,6 +182,10 @@ impl ServerType {
                     // Has the same effect as below, disables the local filesystem and locks the config.
                     ("motherduck_saas_mode", "true".to_string()),
                 ]
+            }
+            Self::Local => {
+                // No security restrictions for local development/testing
+                vec![]
             }
             _ => {
                 // security tips: https://duckdb.org/docs/stable/operations_manual/securing_duckdb/overview

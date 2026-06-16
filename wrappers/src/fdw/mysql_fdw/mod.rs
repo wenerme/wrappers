@@ -16,9 +16,6 @@ enum MysqlFdwError {
     #[error("column conversion failure: {0}")]
     ConversionError(String),
 
-    #[error("connection pool is not initialized")]
-    NoConnectionPool,
-
     #[error("{0}")]
     MysqlError(#[from] mysql_async::Error),
 
@@ -36,6 +33,9 @@ enum MysqlFdwError {
 
     #[error("vault secret not found for id '{0}'")]
     VaultSecretNotFound(String),
+
+    #[error("operation timed out after {0}s")]
+    Timeout(u64),
 }
 
 impl From<MysqlFdwError> for ErrorReport {

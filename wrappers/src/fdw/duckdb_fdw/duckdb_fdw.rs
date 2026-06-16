@@ -1,5 +1,5 @@
 use crate::stats;
-use duckdb::{self, Connection};
+use duckdb::{self, Config, Connection};
 use pgrx::pg_sys;
 use std::collections::HashMap;
 use std::path::Path;
@@ -107,6 +107,67 @@ impl DuckdbFdw {
         Ok(sql)
     }
 
+    fn deparse_aggregate(
+        &self,
+        aggregates: &[Aggregate],
+        group_by: &[Column],
+        quals: &[Qual],
+    ) -> DuckdbFdwResult<String> {
+        let mut select_items: Vec<String> = Vec::new();
+
+        for col in group_by {
+            select_items.push(col.name.clone());
+        }
+
+        for agg in aggregates {
+            let expr = match agg.kind {
+                AggregateKind::Count => "count(*)".to_string(),
+                AggregateKind::CountColumn => {
+                    let col = agg.column.as_ref().map(|c| c.name.as_str()).unwrap_or("*");
+                    if agg.distinct {
+                        format!("count(distinct {col})")
+                    } else {
+                        format!("count({col})")
+                    }
+                }
+                _ => {
+                    let func = agg.kind.sql_name();
+                    let col = agg.column.as_ref().map(|c| c.name.as_str()).unwrap_or("*");
+                    format!("{func}({col})")
+                }
+            };
+            select_items.push(format!("{expr} as {}", agg.alias));
+        }
+
+        let mut sql = format!(
+            "select {} from {} as _wrappers_tbl",
+            select_items.join(", "),
+            &self.table
+        );
+
+        if !quals.is_empty() {
+            let cond = quals
+                .iter()
+                .map(|q| q.deparse())
+                .collect::<Vec<String>>()
+                .join(" and ");
+            if !cond.is_empty() {
+                sql.push_str(&format!(" where {cond}"));
+            }
+        }
+
+        if !group_by.is_empty() {
+            let group_cols = group_by
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<&str>>()
+                .join(", ");
+            sql.push_str(&format!(" group by {group_cols}"));
+        }
+
+        Ok(sql)
+    }
+
     fn get_table_ddl(
         &self,
         tbl_duckdb: &str,
@@ -156,7 +217,23 @@ impl DuckdbFdw {
 impl ForeignDataWrapper<DuckdbFdwError> for DuckdbFdw {
     fn new(server: ForeignServer) -> DuckdbFdwResult<Self> {
         let svr_type = ServerType::new(&server.options)?;
-        let conn = Connection::open_in_memory()?;
+
+        let mut config = Config::default();
+        if server
+            .options
+            .get("allow_unsigned_extensions")
+            .map(|v| v.as_str())
+            == Some("true")
+        {
+            config = config.allow_unsigned_extensions()?;
+        }
+        let ext_dir = server
+            .options
+            .get("extension_dir")
+            .map(|v| v.as_str())
+            .unwrap_or("/usr/local/lib/duckdb/extensions");
+        config = config.with("extension_directory", ext_dir)?;
+        let conn = Connection::open_in_memory_with_flags(config)?;
 
         stats::inc_stats(Self::FDW_NAME, stats::Metric::CreateTimes, 1);
 
@@ -235,6 +312,75 @@ impl ForeignDataWrapper<DuckdbFdwError> for DuckdbFdw {
 
     fn end_scan(&mut self) -> DuckdbFdwResult<()> {
         self.scan_result.clear();
+        Ok(())
+    }
+
+    fn supported_aggregates(&self) -> Vec<AggregateKind> {
+        vec![
+            AggregateKind::Count,
+            AggregateKind::CountColumn,
+            AggregateKind::Sum,
+            AggregateKind::Avg,
+            AggregateKind::Min,
+            AggregateKind::Max,
+        ]
+    }
+
+    fn supports_group_by(&self) -> bool {
+        true
+    }
+
+    fn begin_aggregate_scan(
+        &mut self,
+        aggregates: &[Aggregate],
+        group_by: &[Column],
+        quals: &[Qual],
+        options: &HashMap<String, String>,
+    ) -> DuckdbFdwResult<()> {
+        self.table = require_option("table", options)?.to_string();
+        self.iter_idx = 0;
+
+        self.init_duckdb()?;
+
+        let sql = self.deparse_aggregate(aggregates, group_by, quals)?;
+        if cfg!(debug_assertions) {
+            log_debug1(&format!("aggregate sql on DuckDB: {sql}"));
+        }
+
+        // Build tgt_cols for aggregate output
+        let mut tgt_cols: Vec<Column> = group_by.to_vec();
+        for agg in aggregates {
+            tgt_cols.push(Column {
+                name: agg.alias.clone(),
+                num: 0,
+                type_oid: agg.type_oid,
+            });
+        }
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let tgt_rows: Result<Vec<_>, DuckdbFdwError> = stmt
+            .query_and_then([], |src_row| {
+                let mut tgt_row = Row::new();
+                for (col_idx, tgt_col) in tgt_cols.iter().enumerate() {
+                    let cell = mapper::map_cell(src_row, col_idx, tgt_col)?;
+                    tgt_row.push(&tgt_col.name, cell);
+                }
+                Ok(tgt_row)
+            })?
+            .collect();
+        self.scan_result = tgt_rows?;
+
+        stats::inc_stats(
+            Self::FDW_NAME,
+            stats::Metric::RowsIn,
+            self.scan_result.len() as _,
+        );
+        stats::inc_stats(
+            Self::FDW_NAME,
+            stats::Metric::RowsOut,
+            self.scan_result.len() as _,
+        );
+
         Ok(())
     }
 
