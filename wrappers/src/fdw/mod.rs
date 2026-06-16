@@ -54,3 +54,9 @@ mod duckdb_fdw;
 
 #[cfg(feature = "dynamodb_fdw")]
 mod dynamodb_fdw;
+
+#[cfg(feature = "tencent_cls_fdw")]
+mod tencent_cls_fdw;
+
+#[cfg(feature = "prometheus_fdw")]
+mod prometheus_fdw;

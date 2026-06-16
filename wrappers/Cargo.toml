@@ -147,6 +147,20 @@ mongodb_fdw = [
     "mongodb/bson-2",
     "mongodb/compat-3-3-0",
 ]
+tencent_cls_fdw = [
+    "reqwest",
+    "reqwest-middleware",
+    "reqwest-retry",
+    "serde_json",
+    "serde",
+    "hmac",
+    "sha2",
+    "hex",
+    "chrono",
+    "tokio",
+    "url",
+    "thiserror",
+]
 redis_fdw = ["redis", "serde_json", "thiserror"]
 wasm_fdw = [
     "wasmtime",
@@ -183,6 +197,12 @@ iceberg_fdw = [
     "serde_json",
     "thiserror",
     "uuid",
+]
+prometheus_fdw = [
+    "reqwest",
+    "serde_json",
+    "tokio",
+    "thiserror",
 ]
 duckdb_fdw = [
     "arrow-array-compat",
@@ -221,6 +241,8 @@ native_fdws = [
     "iceberg_fdw",
     "duckdb_fdw",
     "dynamodb_fdw",
+    "tencent_cls_fdw",
+    "prometheus_fdw",
 ]
 all_fdws = ["native_fdws", "wasm_fdw"]
 [dependencies]
@@ -344,6 +366,7 @@ jwt-simple = { version = "0.12.9", default-features = false, features = [
 ], optional = true }
 dirs = { version = "5.0.1", optional = true }
 sha2 = { version = "0.10.8", optional = true }
+hmac = { version = "0.12", optional = true }
 hex = { version = "0.4.3", optional = true }
 bytes = { version = "1.11.1", optional = true }
 thiserror = { version = "1.0.48", optional = true }

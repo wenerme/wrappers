@@ -618,7 +618,12 @@ impl FdwScanPrivate {
                         QualValueMode::ScalarConst
                     };
                     Self::push_i32(list, mcx, mode as i32);
-                    list.unstable_push_in_context(addr as *mut c_void, mcx);
+                    // Copy the Const into the current (planner) context: quals are
+                    // extracted in the scan's tmp_ctx, which is deleted right after
+                    // fdw_private is built, so a Const created there (e.g. a folded
+                    // `now() - interval '1 day'`) would otherwise dangle.
+                    let cst = pg_sys::copyObjectImpl(addr as *const c_void);
+                    list.unstable_push_in_context(cst, mcx);
                 }
                 None => match &qual.value {
                     Value::Cell(Cell::Bool(b)) => {
