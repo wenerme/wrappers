@@ -560,6 +560,13 @@ pub struct Qual {
     // to keep `Qual` `Send`, which is important for FDWs like ClickHouse that
     // move quals across tokio task boundaries.
     pub(crate) value_const: Option<usize>,
+
+    // Address of a pseudo-constant expression (no Vars, no volatile functions,
+    // e.g. `now() - interval '1 day'`) whose value must be computed when the scan
+    // starts rather than frozen into a possibly cached plan. Carried through
+    // fdw_private like `value_const`; `value` is refreshed from it in
+    // begin_foreign_scan and re_scan_foreign_scan.
+    pub(crate) value_expr: Option<usize>,
 }
 
 impl Qual {

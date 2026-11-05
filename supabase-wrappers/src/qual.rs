@@ -146,52 +146,88 @@ pub unsafe fn form_array_from_datum(
     }
 }
 
-/// Try to evaluate a non-Const, non-Param expression to a constant at
-/// planning time. This handles stable/immutable expressions like
-/// `now() - interval '1 hour'` by asking PostgreSQL to evaluate them.
+/// Check whether `expr` can be evaluated once per scan without a row: only
+/// constants, `PARAM_EXTERN` parameters and non-volatile function/operator calls
+/// over them. Column references, sub-plans, `PARAM_EXEC` parameters (whose values
+/// are not available yet when the scan begins) and anything unknown are rejected,
+/// so such quals are left to Postgres.
 ///
-/// Returns a `Const` node allocated in the current (planner) memory context,
-/// so the qual can reference it via `value_const` and survive the
-/// `fdw_private` round trip into the executor.
+/// Sets `has_param` if the expression references a `PARAM_EXTERN` parameter.
 ///
 /// # Safety
 ///
-/// `expr` must be a valid expression node pointer.
-unsafe fn try_eval_const_expr(expr: *mut pg_sys::Node) -> Option<*mut pg_sys::Const> {
+/// `expr` must be a valid expression node pointer (or null).
+unsafe fn is_scan_constant_expr(expr: *mut pg_sys::Node, has_param: &mut bool) -> bool {
     unsafe {
-        // Volatile expressions (e.g. random()) must be evaluated per row by
-        // Postgres, never folded once at planning time.
+        if expr.is_null() {
+            return false;
+        }
+        let args = match (*expr).type_ {
+            pg_sys::NodeTag::T_Const => return true,
+            pg_sys::NodeTag::T_SQLValueFunction => return true,
+            pg_sys::NodeTag::T_Param => {
+                let param = expr as *mut pg_sys::Param;
+                *has_param = true;
+                return (*param).paramkind == pg_sys::ParamKind::PARAM_EXTERN;
+            }
+            pg_sys::NodeTag::T_RelabelType => {
+                return is_scan_constant_expr((*(expr as *mut pg_sys::RelabelType)).arg as _, has_param);
+            }
+            pg_sys::NodeTag::T_CoerceViaIO => {
+                return is_scan_constant_expr((*(expr as *mut pg_sys::CoerceViaIO)).arg as _, has_param);
+            }
+            pg_sys::NodeTag::T_FuncExpr => (*(expr as *mut pg_sys::FuncExpr)).args,
+            pg_sys::NodeTag::T_OpExpr => (*(expr as *mut pg_sys::OpExpr)).args,
+            _ => return false,
+        };
         if pg_sys::contain_volatile_functions(expr) {
-            return None;
+            return false;
         }
+        pgrx::memcx::current_context(|mcx| {
+            List::<*mut c_void>::downcast_ptr_in_memcx(args, mcx).is_some_and(|args| {
+                args.iter()
+                    .all(|arg| is_scan_constant_expr(*arg as _, has_param))
+            })
+        })
+    }
+}
 
-        // Use eval_const_expressions to try to simplify the expression.
-        // This will fold stable functions (like now()) that are safe to
-        // evaluate at planning time.
-        let simplified = pg_sys::eval_const_expressions(ptr::null_mut(), expr);
-        if simplified.is_null() {
-            return None;
+/// Coerce the right-hand side of `col op rhs` to the column's type when Postgres
+/// compares a timestamp column across the timestamp/timestamptz/date boundary.
+///
+/// Such comparisons are evaluated in the session time zone (e.g. `ts >= now()`
+/// compares the `timestamp` column as session-local time), but a remote source only
+/// sees a literal, so the literal must already be in the column's own type.
+/// Returns `rhs` unchanged when no time zone dependent coercion is needed.
+///
+/// # Safety
+///
+/// `rhs` must be a valid expression node pointer.
+unsafe fn coerce_to_column_time_type(
+    rhs: *mut pg_sys::Node,
+    col_type: pg_sys::Oid,
+) -> Option<*mut pg_sys::Node> {
+    unsafe {
+        let rhs_type = pg_sys::exprType(rhs);
+        let ts = pg_sys::TIMESTAMPOID;
+        let tstz = pg_sys::TIMESTAMPTZOID;
+        let date = pg_sys::DATEOID;
+        let needs_coerce = (col_type == ts && rhs_type == tstz)
+            || (col_type == tstz && (rhs_type == ts || rhs_type == date));
+        if !needs_coerce {
+            return Some(rhs);
         }
-
-        // If it simplified to a Const, use it directly
-        if is_a(simplified, pg_sys::NodeTag::T_Const) {
-            return Some(simplified as *mut pg_sys::Const);
-        }
-
-        // If not fully reduced to Const, evaluate it directly. This handles
-        // cases like now() which is stable within a transaction.
-        // evaluate_expr builds its own executor state and copies the result
-        // into the current memory context.
-        let cst = pg_sys::evaluate_expr(
-            expr as *mut pg_sys::Expr,
-            pg_sys::exprType(expr),
-            pg_sys::exprTypmod(expr),
-            pg_sys::exprCollation(expr),
+        let coerced = pg_sys::coerce_to_target_type(
+            ptr::null_mut(),
+            rhs,
+            rhs_type,
+            col_type,
+            -1,
+            pg_sys::CoercionContext::COERCION_EXPLICIT,
+            pg_sys::CoercionForm::COERCE_IMPLICIT_CAST,
+            -1,
         );
-        if cst.is_null() || !is_a(cst as _, pg_sys::NodeTag::T_Const) {
-            return None;
-        }
-        Some(cst as *mut pg_sys::Const)
+        (!coerced.is_null()).then_some(coerced)
     }
 }
 
@@ -272,6 +308,7 @@ unsafe fn try_extract_jsonb_qual(
                 use_or: false,
                 param: None,
                 value_const: Some(right as usize),
+                value_expr: None,
             })
         })
     }
@@ -364,6 +401,9 @@ pub(crate) unsafe fn extract_from_op_expr(
                     {
                         let field = pg_sys::get_attname(baserel_id, (*left).varattno, false);
 
+                        let right = coerce_to_column_time_type(right, (*left).vartype)?;
+
+                        let mut value_expr = None;
                         let (value, param, value_const) = if is_a(right, pg_sys::NodeTag::T_Const) {
                             let right = right as *mut pg_sys::Const;
                             (
@@ -394,20 +434,39 @@ pub(crate) unsafe fn extract_from_op_expr(
                                 },
                             };
                             (Some(Cell::I64(0)), Some(param), None)
-                        } else if let Some(cst) = try_eval_const_expr(right) {
-                            // Try to evaluate stable/immutable expressions
-                            // like now() - interval '1 hour' to a constant
-                            (
-                                Cell::from_polymorphic_datum(
-                                    (*cst).constvalue,
-                                    (*cst).constisnull,
-                                    (*cst).consttype,
-                                ),
-                                None,
-                                Some(cst as usize),
-                            )
                         } else {
-                            (None, None, None)
+                            // Pseudo-constant expression such as `now() - interval '1 day'`
+                            // or a time zone coercion added above: its value is computed
+                            // when the scan begins (see scan::assign_expr_values) so a
+                            // cached plan never reuses a stale value. When it has no
+                            // parameters it is also evaluated now, so planning-time
+                            // callbacks see a real value.
+                            let mut has_param = false;
+                            if is_scan_constant_expr(right, &mut has_param) {
+                                pg_sys::fix_opfuncids(right);
+                                let value = if has_param {
+                                    Some(Cell::String("null".to_string()))
+                                } else {
+                                    // a NULL (or unsupported) result is not pushed down
+                                    let cst = pg_sys::evaluate_expr(
+                                        right as *mut pg_sys::Expr,
+                                        pg_sys::exprType(right),
+                                        pg_sys::exprTypmod(right),
+                                        pg_sys::exprCollation(right),
+                                    ) as *mut pg_sys::Const;
+                                    Cell::from_polymorphic_datum(
+                                        (*cst).constvalue,
+                                        (*cst).constisnull,
+                                        (*cst).consttype,
+                                    )
+                                };
+                                if value.is_some() {
+                                    value_expr = Some(right as usize);
+                                }
+                                (value, None, None)
+                            } else {
+                                (None, None, None)
+                            }
                         };
 
                         if let Some(value) = value {
@@ -418,6 +477,7 @@ pub(crate) unsafe fn extract_from_op_expr(
                                 use_or: false,
                                 param,
                                 value_const,
+                                value_expr,
                             };
                             return Some(qual);
                         }
@@ -459,6 +519,7 @@ pub(crate) unsafe fn extract_from_null_test(
             use_or: false,
             param: None,
             value_const: None,
+            value_expr: None,
         };
 
         Some(qual)
@@ -510,6 +571,7 @@ pub(crate) unsafe fn extract_from_scalar_array_op_expr(
                                 use_or: (*expr).useOr,
                                 param: None,
                                 value_const: Some(right as usize),
+                                value_expr: None,
                             };
                             return Some(qual);
                         }
@@ -548,6 +610,7 @@ pub(crate) unsafe fn extract_from_var(
             use_or: false,
             param: None,
             value_const: None,
+            value_expr: None,
         };
 
         Some(qual)
@@ -583,6 +646,7 @@ pub(crate) unsafe fn extract_from_bool_expr(
                     use_or: false,
                     param: None,
                     value_const: None,
+                    value_expr: None,
                 };
 
                 return Some(qual);
@@ -620,6 +684,7 @@ pub(crate) unsafe fn extract_from_boolean_test(
             use_or: false,
             param: None,
             value_const: None,
+            value_expr: None,
         };
 
         Some(qual)

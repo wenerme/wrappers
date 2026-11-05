@@ -199,6 +199,11 @@ impl CellFormatter for MysqlCellFormatter {
                 let s = v.0.to_string();
                 format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
             }
+            // MySQL DATETIME has no time zone and timestamptz columns are read back
+            // as UTC (see field_to_cell), so write timestamptz values as UTC
+            // wall-clock literals; the default rendering has a `+08` style offset
+            // that MySQL rejects.
+            Cell::Timestamptz(v) => format!("{}", Cell::Timestamp(v.to_utc())),
             _ => format!("{cell}"),
         }
     }

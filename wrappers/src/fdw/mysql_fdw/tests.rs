@@ -1223,4 +1223,129 @@ mod tests {
             );
         });
     }
+
+    // Quals comparing a time column with a pseudo-constant expression such as
+    // `now() - interval '1 day'` are evaluated in the session time zone. The pushed
+    // down literal must match that, otherwise aggregate pushdown (which has no
+    // local recheck) returns wrong counts. Column-vs-column quals must not be
+    // evaluated at planning time at all.
+    fn setup_mysql_time_qual_test_data() {
+        let rt = create_async_runtime().expect("failed to create runtime");
+        let pool = Pool::new("mysql://root:password@localhost:3306/testdb");
+        let mut conn = rt
+            .block_on(async {
+                let conn = pool.get_conn().await?;
+                Ok::<_, MySqlError>(conn)
+            })
+            .expect("failed to connect to mysql");
+
+        let mut exec = |sql: &str| {
+            rt.block_on(async {
+                conn.query_drop(sql).await?;
+                Ok::<_, MySqlError>(())
+            })
+            .expect("failed to execute query");
+        };
+
+        exec("CREATE DATABASE IF NOT EXISTS testdb");
+        exec("DROP TABLE IF EXISTS testdb.time_quals");
+        exec(
+            "CREATE TABLE testdb.time_quals (
+                id   BIGINT PRIMARY KEY,
+                ts   DATETIME NOT NULL,
+                a    BIGINT NOT NULL,
+                b    BIGINT NOT NULL
+            )",
+        );
+        // one row every 30 minutes over the last 3 days, as UTC wall-clock time;
+        // half-hour offsets keep row timestamps away from hour-aligned cutoffs
+        exec(
+            "INSERT INTO testdb.time_quals (id, ts, a, b)
+             WITH RECURSIVE seq(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n < 143)
+             SELECT n, UTC_TIMESTAMP() - INTERVAL n * 30 MINUTE + INTERVAL 7 MINUTE, n % 7, n % 5
+             FROM seq",
+        );
+    }
+
+    #[pg_test]
+    fn mysql_time_zone_quals_test() {
+        setup_mysql_time_qual_test_data();
+
+        Spi::connect_mut(|c| {
+            c.update(
+                r#"CREATE FOREIGN DATA WRAPPER mysql_wrapper
+                    HANDLER mysql_fdw_handler VALIDATOR mysql_fdw_validator"#,
+                None,
+                &[],
+            )
+            .expect("failed to create foreign data wrapper");
+            c.update(
+                r#"CREATE SERVER mysql_server
+                     FOREIGN DATA WRAPPER mysql_wrapper
+                     OPTIONS (conn_string 'mysql://root:password@localhost:3306/testdb')"#,
+                None,
+                &[],
+            )
+            .expect("failed to create server");
+            // the same remote DATETIME column exposed as timestamp and timestamptz
+            c.update(
+                r#"CREATE FOREIGN TABLE tq_ts (id bigint, ts timestamp, a bigint, b bigint)
+                     SERVER mysql_server OPTIONS (table 'time_quals')"#,
+                None,
+                &[],
+            )
+            .expect("failed to create foreign table");
+            c.update(
+                r#"CREATE FOREIGN TABLE tq_tstz (id bigint, ts timestamptz, a bigint, b bigint)
+                     SERVER mysql_server OPTIONS (table 'time_quals')"#,
+                None,
+                &[],
+            )
+            .expect("failed to create foreign table");
+            c.update("SET TIME ZONE 'Asia/Shanghai'", None, &[])
+                .expect("failed to set time zone");
+
+            let count = |c: &pgrx::spi::SpiClient<'_>, sql: &str| -> i64 {
+                c.select(sql, None, &[])
+                    .unwrap_or_else(|e| panic!("query failed [{sql}]: {e}"))
+                    .first()
+                    .get_one::<i64>()
+                    .unwrap()
+                    .unwrap()
+            };
+
+            for (tbl, cond) in [
+                ("tq_ts", "ts >= now() - interval '1 day'"),
+                ("tq_ts", "ts < now() - interval '1 day'"),
+                ("tq_ts", "ts >= current_timestamp - interval '30 hours'"),
+                ("tq_ts", "ts >= current_date"),
+                ("tq_ts", "ts >= localtimestamp - interval '1 day'"),
+                ("tq_tstz", "ts >= now() - interval '1 day'"),
+                ("tq_tstz", "ts >= localtimestamp - interval '1 day'"),
+                ("tq_tstz", "ts >= current_date"),
+                ("tq_ts", "a > b"),
+                ("tq_ts", "a = b + 1"),
+            ] {
+                // the OFFSET 0 subquery keeps the qual local, giving a reference
+                let local = count(
+                    c,
+                    &format!("SELECT count(*) FROM (SELECT * FROM {tbl} OFFSET 0) s WHERE {cond}"),
+                );
+                let pushed_agg = count(c, &format!("SELECT count(*) FROM {tbl} WHERE {cond}"));
+                let pushed_scan = count(
+                    c,
+                    &format!("SELECT count(*) FROM (SELECT id FROM {tbl} WHERE {cond} OFFSET 0) s"),
+                );
+                assert!(
+                    local > 0 && local < 144,
+                    "bad fixture for [{cond}]: {local}"
+                );
+                assert_eq!(
+                    pushed_agg, local,
+                    "aggregate pushdown mismatch on {tbl} [{cond}]"
+                );
+                assert_eq!(pushed_scan, local, "scan mismatch on {tbl} [{cond}]");
+            }
+        });
+    }
 }

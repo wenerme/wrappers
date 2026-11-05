@@ -75,6 +75,8 @@ pub(crate) struct FdwState<E: Into<ErrorReport>, W: ForeignDataWrapper<E>> {
     // PARAM_EXEC values (e.g. from `col = (select ...)`) may only become available
     // after begin_foreign_scan, so they are checked again on the first iteration
     recheck_params: bool,
+    // per-qual execution state of `Qual::value_expr`, initialized on first use
+    value_expr_states: Vec<*mut pg_sys::ExprState>,
     _phantom: PhantomData<E>,
 }
 
@@ -101,6 +103,7 @@ impl<E: Into<ErrorReport>, W: ForeignDataWrapper<E>> FdwState<E, W> {
             row: Row::new(),
             param_fingerprint: String::new(),
             recheck_params: false,
+            value_expr_states: Vec::new(),
             _phantom: PhantomData,
         }
     }
@@ -226,13 +229,16 @@ struct FdwScanPrivate {
 /// How a `Qual::value` is encoded in [`FdwScanPrivate`]'s serialized list. `ScalarConst`/
 /// `ArrayConst` embed the original `pg_sys::Const` node (see [`Qual::value_const`]) so
 /// `copyObject` deep-copies it with the correct `consttype`; `Bool` and `Placeholder`
-/// have no source `Const` node to preserve (see `push_qual`/`read_qual`).
+/// have no source `Const` node to preserve (see `push_qual`/`read_qual`). `Expr`
+/// embeds a pseudo-constant expression (see [`Qual::value_expr`]) evaluated when the
+/// scan begins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QualValueMode {
     Bool = 0,
     Placeholder = 1,
     ScalarConst = 2,
     ArrayConst = 3,
+    Expr = 4,
 }
 
 impl QualValueMode {
@@ -242,6 +248,7 @@ impl QualValueMode {
             1 => Some(Self::Placeholder),
             2 => Some(Self::ScalarConst),
             3 => Some(Self::ArrayConst),
+            4 => Some(Self::Expr),
             _ => None,
         }
     }
@@ -624,6 +631,15 @@ impl FdwScanPrivate {
             Self::push_text(list, mcx, &qual.operator);
             Self::push_bool(list, mcx, qual.use_or);
 
+            if let Some(addr) = qual.value_expr {
+                Self::push_i32(list, mcx, QualValueMode::Expr as i32);
+                // copied for the same reason as the Const below
+                let expr = pg_sys::copyObjectImpl(addr as *const c_void);
+                list.unstable_push_in_context(expr, mcx);
+                Self::push_param(list, mcx, &qual.param);
+                return;
+            }
+
             match qual.value_const {
                 Some(addr) => {
                     let mode = if matches!(qual.value, Value::Array(_)) {
@@ -689,7 +705,14 @@ impl FdwScanPrivate {
             let use_or = Self::read_bool(list, idx)?;
 
             let mode = QualValueMode::from_i32(Self::read_i32(list, idx)?)?;
+            let mut value_expr = None;
             let value = match mode {
+                QualValueMode::Expr => {
+                    // actual value is computed in begin_foreign_scan
+                    value_expr = Some(*list.get(*idx)? as usize);
+                    *idx += 1;
+                    Value::Cell(Cell::String("null".to_string()))
+                }
                 QualValueMode::Bool => Value::Cell(Cell::Bool(Self::read_bool(list, idx)?)),
                 QualValueMode::Placeholder => Value::Cell(Cell::String("null".to_string())),
                 QualValueMode::ScalarConst => {
@@ -719,6 +742,7 @@ impl FdwScanPrivate {
                 use_or,
                 param,
                 value_const: None,
+                value_expr,
             })
         }
     }
@@ -813,6 +837,7 @@ impl<E: Into<ErrorReport>, W: ForeignDataWrapper<E>> FdwState<E, W> {
                 row: Row::new(),
                 param_fingerprint: String::new(),
                 recheck_params: false,
+                value_expr_states: Vec::new(),
                 _phantom: PhantomData,
             }
         }
@@ -1189,6 +1214,37 @@ pub(super) extern "C-unwind" fn explain_foreign_scan<
 }
 
 // extract parameter value and assign it to qual in scan state
+/// Compute the current value of every qual backed by a pseudo-constant expression
+/// (`Qual::value_expr`, e.g. `now() - interval '1 day'`). Called when the scan
+/// begins and on rescan, so cached plans always see a fresh value.
+unsafe fn assign_expr_values<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>(
+    node: *mut pg_sys::ForeignScanState,
+    state: &mut FdwState<E, W>,
+) {
+    unsafe {
+        let econtext = (*node).ss.ps.ps_ExprContext;
+        if state.value_expr_states.len() != state.quals.len() {
+            state.value_expr_states = vec![ptr::null_mut(); state.quals.len()];
+        }
+        for (qual, expr_state) in state.quals.iter_mut().zip(state.value_expr_states.iter_mut()) {
+            let Some(addr) = qual.value_expr else {
+                continue;
+            };
+            let expr = addr as *mut pg_sys::Expr;
+            if expr_state.is_null() {
+                *expr_state = pg_sys::ExecInitExpr(expr, node as *mut pg_sys::PlanState);
+            }
+            let mut isnull = false;
+            if let Some(datum) = polyfill::exec_eval_expr(*expr_state, econtext, &mut isnull)
+                && let Some(cell) =
+                    Cell::from_polymorphic_datum(datum, isnull, pg_sys::exprType(expr as _))
+            {
+                qual.value = Value::Cell(cell);
+            }
+        }
+    }
+}
+
 unsafe fn assign_parameter_value<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>(
     node: *mut pg_sys::ForeignScanState,
     state: &mut FdwState<E, W>,
@@ -1257,6 +1313,12 @@ fn compute_param_fingerprint<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>(
         .quals
         .iter()
         .filter_map(|qual| {
+            if qual.value_expr.is_some() {
+                return Some(format!(
+                    "{}|{}|expr|{:?}",
+                    qual.field, qual.operator, qual.value
+                ));
+            }
             qual.param.as_ref().map(|param| {
                 let eval_value = match param.eval_value.lock() {
                     Ok(value) => format!("{:?}", *value),
@@ -1309,6 +1371,7 @@ pub(super) extern "C-unwind" fn begin_foreign_scan<
 
         // assign parameter values to qual
         assign_parameter_value(node, &mut state);
+        assign_expr_values(node, &mut state);
         state.param_fingerprint = compute_param_fingerprint(&state);
         state.recheck_params = state.quals.iter().any(|q| {
             q.param
@@ -1456,6 +1519,7 @@ pub(super) extern "C-unwind" fn re_scan_foreign_scan<
         if !fdw_state.is_null() {
             let mut state = PgBox::<FdwState<E, W>>::from_pg(fdw_state);
             assign_parameter_value(node, &mut state);
+            assign_expr_values(node, &mut state);
             let next_fingerprint = compute_param_fingerprint(&state);
             let result = if next_fingerprint != state.param_fingerprint {
                 state.param_fingerprint = next_fingerprint;
