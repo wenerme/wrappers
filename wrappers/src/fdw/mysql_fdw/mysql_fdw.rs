@@ -3,6 +3,7 @@ use chrono::{NaiveDate, NaiveDateTime};
 use futures_util::stream::StreamExt;
 use mysql_async::{Pool, Row as MySqlRow, prelude::*};
 use pgrx::{PgBuiltInOids, PgOid, pg_sys, prelude::to_timestamp};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -350,7 +351,11 @@ fn spawn_worker(conn_str: String) -> mpsc::SyncSender<WorkerCmd> {
 )]
 pub(crate) struct MysqlFdw {
     /// Channel to the async worker thread (owns the runtime, pool, and stream).
-    tx: mpsc::SyncSender<WorkerCmd>,
+    /// The worker exits on `Disconnect` (end_scan/end_modify); it is spawned again
+    /// on demand because the same instance can be scanned again afterwards, e.g.
+    /// a re-scan with new parameter values.
+    tx: RefCell<Option<mpsc::SyncSender<WorkerCmd>>>,
+    conn_str: String,
     table: String,
     rowid_col: String,
     tgt_cols: Vec<Column>,
@@ -365,6 +370,13 @@ pub(crate) struct MysqlFdw {
 impl MysqlFdw {
     const FDW_NAME: &'static str = "MysqlFdw";
 
+    // stop the worker (drops the stream, then disconnects the pool)
+    fn disconnect_worker(&self) {
+        if let Some(tx) = self.tx.borrow_mut().take() {
+            let _ = tx.send(WorkerCmd::Disconnect);
+        }
+    }
+
     /// Send a command (already containing the reply channel) and block until reply or timeout.
     fn send_cmd(
         &self,
@@ -372,6 +384,8 @@ impl MysqlFdw {
         reply_rx: mpsc::Receiver<WorkerReply>,
     ) -> MysqlFdwResult<WorkerReply> {
         self.tx
+            .borrow_mut()
+            .get_or_insert_with(|| spawn_worker(self.conn_str.clone()))
             .send(cmd)
             .map_err(|_| MysqlFdwError::ConversionError("worker thread gone".into()))?;
         reply_rx
@@ -612,7 +626,8 @@ impl ForeignDataWrapper<MysqlFdwError> for MysqlFdw {
         stats::inc_stats(Self::FDW_NAME, stats::Metric::CreateTimes, 1);
 
         Ok(MysqlFdw {
-            tx: spawn_worker(conn_str),
+            tx: RefCell::new(Some(spawn_worker(conn_str.clone()))),
+            conn_str,
             table: String::default(),
             rowid_col: String::default(),
             tgt_cols: Vec::new(),
@@ -675,7 +690,7 @@ impl ForeignDataWrapper<MysqlFdwError> for MysqlFdw {
     }
 
     fn end_scan(&mut self) -> MysqlFdwResult<()> {
-        let _ = self.tx.send(WorkerCmd::Disconnect);
+        self.disconnect_worker();
         Ok(())
     }
 
@@ -784,7 +799,7 @@ impl ForeignDataWrapper<MysqlFdwError> for MysqlFdw {
     }
 
     fn end_modify(&mut self) -> MysqlFdwResult<()> {
-        let _ = self.tx.send(WorkerCmd::Disconnect);
+        self.disconnect_worker();
         Ok(())
     }
 
@@ -915,7 +930,7 @@ impl ForeignDataWrapper<MysqlFdwError> for MysqlFdw {
             }
         }
 
-        let _ = self.tx.send(WorkerCmd::Disconnect);
+        self.disconnect_worker();
         Ok(ret)
     }
 
