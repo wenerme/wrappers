@@ -72,6 +72,9 @@ pub(crate) struct FdwState<E: Into<ErrorReport>, W: ForeignDataWrapper<E>> {
     row: Row,
     // fingerprint of current parameter values to detect rescan changes
     param_fingerprint: String,
+    // PARAM_EXEC values (e.g. from `col = (select ...)`) may only become available
+    // after begin_foreign_scan, so they are checked again on the first iteration
+    recheck_params: bool,
     _phantom: PhantomData<E>,
 }
 
@@ -97,6 +100,7 @@ impl<E: Into<ErrorReport>, W: ForeignDataWrapper<E>> FdwState<E, W> {
             nulls: Vec::new(),
             row: Row::new(),
             param_fingerprint: String::new(),
+            recheck_params: false,
             _phantom: PhantomData,
         }
     }
@@ -123,6 +127,16 @@ impl<E: Into<ErrorReport>, W: ForeignDataWrapper<E>> FdwState<E, W> {
             instance.begin_aggregate_scan(&self.aggregates, &self.group_by, &self.quals, &self.opts)
         } else {
             Ok(())
+        }
+    }
+
+    // end the active scan and begin it again with the current qual values
+    fn restart_scan(&mut self) -> Result<(), E> {
+        let _ = self.end_scan();
+        if self.is_aggregate_scan() {
+            self.begin_aggregate_scan()
+        } else {
+            self.begin_scan()
         }
     }
 
@@ -798,6 +812,7 @@ impl<E: Into<ErrorReport>, W: ForeignDataWrapper<E>> FdwState<E, W> {
                 nulls: Vec::new(),
                 row: Row::new(),
                 param_fingerprint: String::new(),
+                recheck_params: false,
                 _phantom: PhantomData,
             }
         }
@@ -1295,6 +1310,11 @@ pub(super) extern "C-unwind" fn begin_foreign_scan<
         // assign parameter values to qual
         assign_parameter_value(node, &mut state);
         state.param_fingerprint = compute_param_fingerprint(&state);
+        state.recheck_params = state.quals.iter().any(|q| {
+            q.param
+                .as_ref()
+                .is_some_and(|p| p.kind == pg_sys::ParamKind::PARAM_EXEC)
+        });
 
         // begin scan if it is not EXPLAIN statement
         if eflags & pg_sys::EXEC_FLAG_EXPLAIN_ONLY as c_int <= 0 {
@@ -1341,6 +1361,24 @@ pub(super) extern "C-unwind" fn iterate_foreign_scan<
 
         // evaluate parameter values
         assign_parameter_value(node, &mut state);
+
+        // An initplan parameter (e.g. `col = (select max(x) from t)`) is only
+        // computed once the executor first asks for it, which is after
+        // begin_foreign_scan has already started the remote scan with a
+        // placeholder value. Restart the scan once with the real value.
+        if state.recheck_params {
+            state.recheck_params = false;
+            let fingerprint = compute_param_fingerprint(&state);
+            if fingerprint != state.param_fingerprint {
+                state.param_fingerprint = fingerprint;
+                let result = state.restart_scan();
+                if result.is_err() {
+                    drop_fdw_state(state.as_ptr());
+                    (*node).fdw_state = ptr::null::<FdwState<E, W>>() as _;
+                    result.report_unwrap();
+                }
+            }
+        }
 
         // clear slot
         let slot = (*node).ss.ss_ScanTupleSlot;
@@ -1421,9 +1459,9 @@ pub(super) extern "C-unwind" fn re_scan_foreign_scan<
             let next_fingerprint = compute_param_fingerprint(&state);
             let result = if next_fingerprint != state.param_fingerprint {
                 state.param_fingerprint = next_fingerprint;
-                // end the active scan to release resources before restarting with new params
-                let _ = state.end_scan();
-                state.begin_scan()
+                // end the active scan to release resources before restarting with
+                // new params; aggregate scans must be restarted as aggregate scans
+                state.restart_scan()
             } else {
                 state.re_scan()
             };

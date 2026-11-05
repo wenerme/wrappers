@@ -1114,4 +1114,113 @@ mod tests {
             }
         });
     }
+
+    // Regression test: quals referencing an initplan parameter, e.g.
+    // `col = (select max(x) from t)`, get their value only after the foreign scan
+    // has begun; scans must not run with the placeholder value. Correlated
+    // subqueries re-scan the foreign scan with a new parameter for every outer row.
+    fn setup_mysql_param_exec_test_data() {
+        let rt = create_async_runtime().expect("failed to create runtime");
+        let pool = Pool::new("mysql://root:password@localhost:3306/testdb");
+        let mut conn = rt
+            .block_on(async {
+                let conn = pool.get_conn().await?;
+                Ok::<_, MySqlError>(conn)
+            })
+            .expect("failed to connect to mysql");
+
+        let mut exec = |sql: &str| {
+            rt.block_on(async {
+                conn.query_drop(sql).await?;
+                Ok::<_, MySqlError>(())
+            })
+            .expect("failed to execute query");
+        };
+
+        exec("CREATE DATABASE IF NOT EXISTS testdb");
+        exec("DROP TABLE IF EXISTS testdb.orders_param");
+        exec(
+            "CREATE TABLE testdb.orders_param (
+                id     BIGINT PRIMARY KEY,
+                status VARCHAR(50) NOT NULL,
+                amount BIGINT NOT NULL
+            )",
+        );
+        exec(
+            "INSERT INTO testdb.orders_param (id, status, amount) VALUES
+                (1, 'active', 100), (2, 'active', 50), (3, 'inactive', 200),
+                (4, 'active', 75), (5, 'inactive', 150)",
+        );
+    }
+
+    #[pg_test]
+    fn mysql_param_exec_test() {
+        setup_mysql_param_exec_test_data();
+
+        Spi::connect_mut(|c| {
+            c.update(
+                r#"CREATE FOREIGN DATA WRAPPER mysql_wrapper
+                    HANDLER mysql_fdw_handler VALIDATOR mysql_fdw_validator"#,
+                None,
+                &[],
+            )
+            .expect("failed to create foreign data wrapper");
+            c.update(
+                r#"CREATE SERVER mysql_server
+                     FOREIGN DATA WRAPPER mysql_wrapper
+                     OPTIONS (conn_string 'mysql://root:password@localhost:3306/testdb')"#,
+                None,
+                &[],
+            )
+            .expect("failed to create server");
+            c.update(
+                r#"CREATE FOREIGN TABLE orders_param (id bigint, status text, amount bigint)
+                     SERVER mysql_server OPTIONS (table 'orders_param')"#,
+                None,
+                &[],
+            )
+            .expect("failed to create foreign table");
+            c.update(
+                "CREATE TABLE local_status AS SELECT 'inactive'::text AS status",
+                None,
+                &[],
+            )
+            .expect("failed to create local table");
+
+            let ids = |c: &pgrx::spi::SpiClient<'_>, sql: &str| -> Vec<i64> {
+                c.select(sql, None, &[])
+                    .unwrap_or_else(|e| panic!("query failed [{sql}]: {e}"))
+                    .filter_map(|r| r.get::<i64>(1).unwrap())
+                    .collect()
+            };
+
+            // initplan parameter, plain scan
+            assert_eq!(
+                ids(
+                    c,
+                    "SELECT id FROM orders_param
+                     WHERE status = (SELECT status FROM local_status) ORDER BY id"
+                ),
+                vec![3, 5]
+            );
+            // initplan parameter, aggregate
+            assert_eq!(
+                ids(
+                    c,
+                    "SELECT count(*) FROM orders_param
+                     WHERE status = (SELECT status FROM local_status)"
+                ),
+                vec![2]
+            );
+            // correlated subquery: one re-scan per outer row
+            assert_eq!(
+                ids(
+                    c,
+                    "SELECT (SELECT count(*) FROM orders_param o WHERE o.status = s.status)
+                     FROM (VALUES ('active'), ('inactive')) s(status) ORDER BY 1"
+                ),
+                vec![2, 3]
+            );
+        });
+    }
 }
