@@ -338,6 +338,24 @@ pub(super) extern "C-unwind" fn get_foreign_upper_paths<
             return;
         }
 
+        // Runtime parameters and expressions do not have a representation for
+        // SQL NULL in `Value`.  A NULL parameter could therefore leave the
+        // previous remote value in place, which is especially dangerous here:
+        // aggregate scans have no local qual recheck.  Keep these scans local
+        // until the execution path can represent and deparse NULL values
+        // correctly.  Plain foreign scans still use the normal executor
+        // recheck and PARAM_EXEC rescan handling.
+        if state
+            .quals
+            .iter()
+            .any(|qual| qual.param.is_some() || qual.value_expr.is_some())
+        {
+            debug2!(
+                "Runtime qual values present, skipping aggregate pushdown for safe NULL semantics"
+            );
+            return;
+        }
+
         // Extract aggregates from the query
         let aggregates = match extract_aggregates(root, output_rel, extra) {
             Some(aggs) => aggs,

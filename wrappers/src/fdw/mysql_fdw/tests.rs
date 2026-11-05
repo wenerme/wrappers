@@ -1221,6 +1221,18 @@ mod tests {
                 ),
                 vec![2, 3]
             );
+            // A NULL correlated parameter must not reuse the previous remote
+            // value. Runtime-valued aggregate quals stay local until NULL can
+            // be represented explicitly in the FDW value protocol.
+            assert_eq!(
+                ids(
+                    c,
+                    "SELECT (SELECT count(*) FROM orders_param o WHERE o.status = s.status)
+                     FROM (VALUES ('active'::text), (NULL::text), ('inactive'::text)) s(status)
+                     ORDER BY 1"
+                ),
+                vec![0, 2, 3]
+            );
         });
     }
 
